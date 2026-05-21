@@ -77,6 +77,30 @@ const fmtDate = (iso: string) => {
   };
 };
 
+const STATUSES_STORAGE_PREFIX = "tournament_statuses:";
+
+const loadLocalStatuses = (username: string): StatusMap => {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = localStorage.getItem(STATUSES_STORAGE_PREFIX + username);
+    return raw ? (JSON.parse(raw) as StatusMap) : {};
+  } catch {
+    return {};
+  }
+};
+
+const saveLocalStatuses = (username: string, statuses: StatusMap): void => {
+  if (typeof window === "undefined") return;
+  try {
+    localStorage.setItem(
+      STATUSES_STORAGE_PREFIX + username,
+      JSON.stringify(statuses)
+    );
+  } catch {
+    /* quota exceeded or private mode — best effort */
+  }
+};
+
 const vegasISO = (): string => {
   // Las Vegas is America/Los_Angeles (PST/PDT); honor that regardless of viewer's TZ.
   const parts = new Intl.DateTimeFormat("en-CA", {
@@ -380,20 +404,29 @@ export default function PokerSchedule() {
     }
   }, []);
 
-  // Fetch statuses when username available.
+  // Load statuses when username available. localStorage is the source of
+  // truth so the app works on any host without a database; the API is a
+  // best-effort sync layer that, when reachable, merges remote data in.
   useEffect(() => {
     if (!username) {
       setStatuses({});
       return;
     }
+    setStatuses(loadLocalStatuses(username));
+
     let cancelled = false;
     fetch("/api/me/statuses", { headers: { "x-username": username } })
       .then((r) => (r.ok ? r.json() : Promise.reject(r)))
       .then((data: StatusMap) => {
-        if (!cancelled) setStatuses(data);
+        if (cancelled || !data || Object.keys(data).length === 0) return;
+        setStatuses((prev) => {
+          const merged = { ...prev, ...data };
+          saveLocalStatuses(username, merged);
+          return merged;
+        });
       })
       .catch(() => {
-        /* keep empty; UI still works */
+        /* no DB / offline — localStorage already loaded */
       });
     return () => {
       cancelled = true;
@@ -440,7 +473,11 @@ export default function PokerSchedule() {
             : prior?.cash_amount ?? null,
         notes: patch.notes !== undefined ? patch.notes : prior?.notes ?? null,
       };
-      setStatuses((prev) => ({ ...prev, [k]: optimistic }));
+      setStatuses((prev) => {
+        const next = { ...prev, [k]: optimistic };
+        saveLocalStatuses(username, next);
+        return next;
+      });
 
       fetch("/api/me/statuses", {
         method: "PUT",
@@ -458,15 +495,14 @@ export default function PokerSchedule() {
       })
         .then((r) => (r.ok ? r.json() : Promise.reject(r)))
         .then((row: EventStatus) => {
-          setStatuses((prev) => ({ ...prev, [k]: row }));
-        })
-        .catch(() => {
           setStatuses((prev) => {
-            const next = { ...prev };
-            if (prior) next[k] = prior;
-            else delete next[k];
+            const next = { ...prev, [k]: row };
+            saveLocalStatuses(username, next);
             return next;
           });
+        })
+        .catch(() => {
+          /* no DB — localStorage already has the optimistic value */
         });
     },
     [statuses, username]
@@ -479,20 +515,20 @@ export default function PokerSchedule() {
         return;
       }
       const k = eventKey(ev);
-      const prior = statuses[k];
       setStatuses((prev) => {
         const next = { ...prev };
         delete next[k];
+        saveLocalStatuses(username, next);
         return next;
       });
       fetch(`/api/me/statuses?event_key=${encodeURIComponent(k)}`, {
         method: "DELETE",
         headers: { "x-username": username },
       }).catch(() => {
-        if (prior) setStatuses((prev) => ({ ...prev, [k]: prior }));
+        /* no DB — localStorage already cleared */
       });
     },
-    [statuses, username]
+    [username]
   );
 
   // Measure filter bar height for sticky date header offset
